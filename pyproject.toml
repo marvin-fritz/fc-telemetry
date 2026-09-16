@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fc-telemetry"
+version = "0.1.0"
+description = "Einheitliches JSON-Logging, MongoDB-Aktivitätszähler und Heartbeats für die Finanz-Copilot-Dienste"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["pymongo>=4.6,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "mongomock>=4.1,<5"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fc_telemetry"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
