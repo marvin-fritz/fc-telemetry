@@ -69,3 +69,17 @@ def test_install_is_idempotent_and_registers_globally():
     b = install_mongo_activity()
     assert a is b
     assert a in pymongo.monitoring._LISTENERS.command_listeners
+
+
+def test_stale_inflight_entries_are_evicted_on_snapshot():
+    clock_state = {"time": 0.0}
+
+    def mock_clock():
+        return clock_state["time"]
+
+    l = MongoActivity(clock=mock_clock)
+    _started(l, "find", "news", 1)
+    clock_state["time"] = 61.0  # advance clock by 61 seconds
+    snap = l.snapshot_and_reset()
+    assert snap["reads"] == 0
+    assert l._inflight == {}

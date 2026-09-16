@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from pymongo import monitoring
 
 READ_COMMANDS = frozenset({"find", "aggregate", "count", "countDocuments", "distinct", "getMore"})
 WRITE_COMMANDS = frozenset({"insert", "update", "delete", "findAndModify", "bulkWrite"})
 IGNORED_COLLECTIONS = frozenset({"systemHeartbeats", "systemHeartbeatHistory"})
+INFLIGHT_MAX_AGE_SECONDS = 60.0
+INFLIGHT_MAX_ENTRIES = 10_000
 
 
 def _collection_of(event) -> str | None:
@@ -21,9 +24,10 @@ def _collection_of(event) -> str | None:
 
 
 class MongoActivity(monitoring.CommandListener):
-    def __init__(self) -> None:
+    def __init__(self, clock=None) -> None:
         self._lock = threading.Lock()
-        self._inflight: dict[int, tuple[str, str]] = {}
+        self._clock = clock if clock is not None else time.monotonic
+        self._inflight: dict[int, tuple[str, str, float]] = {}
         self._reset_locked()
 
     def _reset_locked(self) -> None:
@@ -46,14 +50,16 @@ class MongoActivity(monitoring.CommandListener):
         if coll is None or coll in IGNORED_COLLECTIONS:
             return
         with self._lock:
-            self._inflight[event.request_id] = (kind, coll)
+            if len(self._inflight) > INFLIGHT_MAX_ENTRIES:
+                self._inflight.clear()
+            self._inflight[event.request_id] = (kind, coll, self._clock())
 
     def _finish(self, event, failed: bool) -> None:
         with self._lock:
             entry = self._inflight.pop(event.request_id, None)
             if entry is None:
                 return
-            kind, coll = entry
+            kind, coll, _ = entry
             if kind == "reads":
                 self._reads += 1
             else:
@@ -62,7 +68,10 @@ class MongoActivity(monitoring.CommandListener):
                 self._errors += 1
             self._latency_micros += int(event.duration_micros)
             self._count += 1
-            bucket = self._by_collection.setdefault(coll, {"reads": 0, "writes": 0})
+            bucket = self._by_collection.get(coll)
+            if bucket is None:
+                bucket = {"reads": 0, "writes": 0}
+                self._by_collection[coll] = bucket
             bucket[kind] += 1
 
     def succeeded(self, event) -> None:
@@ -73,6 +82,13 @@ class MongoActivity(monitoring.CommandListener):
 
     def snapshot_and_reset(self) -> dict:
         with self._lock:
+            now = self._clock()
+            stale_ids = [
+                req_id for req_id, (_, _, start_time) in self._inflight.items()
+                if now - start_time > INFLIGHT_MAX_AGE_SECONDS
+            ]
+            for req_id in stale_ids:
+                del self._inflight[req_id]
             avg = (self._latency_micros / self._count / 1000.0) if self._count else 0.0
             snap = {
                 "reads": self._reads,
