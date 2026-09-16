@@ -5,7 +5,15 @@ import logging
 import pytest
 
 from fc_telemetry.context import job_context
-from fc_telemetry.logging_setup import JsonFormatter, LogCounterHandler, setup_logging
+from fc_telemetry.logging_setup import JsonFormatter, LogCounterHandler, setup_logging, _reset_for_tests
+
+
+@pytest.fixture(autouse=True)
+def reset_logging():
+    """Reset logging state before and after each test."""
+    _reset_for_tests()
+    yield
+    _reset_for_tests()
 
 
 def _record(msg="hallo", level=logging.INFO, name="kraken.news", exc_info=None, extra=None):
@@ -26,6 +34,7 @@ def test_json_formatter_required_fields_only():
 
 
 def test_json_formatter_optional_fields():
+    setup_logging("kraken", fmt="json", stream=io.StringIO())
     with job_context("news"):
         record = _record(extra={"duration_ms": 12.5, "isin": "DE0007"})
     try:

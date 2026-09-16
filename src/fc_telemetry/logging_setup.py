@@ -11,22 +11,9 @@ from typing import IO
 
 from .context import current_job
 
-
-# Install a custom LogRecord factory to capture the current job at record creation time.
-_original_log_record_factory = logging.getLogRecordFactory()
-
-
-def _job_capture_factory(name, level, fn, lno, msg, args, exc_info=None, func=None, sinfo=None, **kwargs):
-    """LogRecord factory that captures the current job context."""
-    record = _original_log_record_factory(name, level, fn, lno, msg, args, exc_info, func, sinfo, **kwargs)
-    if not hasattr(record, 'job'):
-        job = current_job()
-        if job:
-            record.job = job
-    return record
-
-
-logging.setLogRecordFactory(_job_capture_factory)
+# Track the original LogRecord factory (saved only once).
+_previous_factory = None
+_factory_is_installed = False
 
 # Felder eines LogRecord, die kein "extra" sind.
 _STANDARD_ATTRS = frozenset(
@@ -59,13 +46,10 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
-        # Check if job was captured in the record (at creation time), otherwise fall back to current context
-        if hasattr(record, 'job'):
-            data["job"] = record.job
-        else:
-            job = current_job()
-            if job:
-                data["job"] = job
+        # Prefer job captured at record creation time (via factory in setup_logging); fall back for hand-built records.
+        job = getattr(record, 'job', None) or current_job()
+        if job:
+            data["job"] = job
         extra = {k: v for k, v in record.__dict__.items() if k not in _STANDARD_ATTRS and not k.startswith("_")}
         # Remove job from extra since we handle it separately
         extra.pop("job", None)
@@ -89,19 +73,19 @@ class LogCounterHandler(logging.Handler):
 
     def __init__(self) -> None:
         super().__init__(level=logging.WARNING)
-        self._lock2 = threading.Lock()
+        self._lock = threading.Lock()
         self._warnings = 0
         self._errors = 0
 
     def emit(self, record: logging.LogRecord) -> None:
-        with self._lock2:
+        with self._lock:
             if record.levelno >= logging.ERROR:
                 self._errors += 1
             else:
                 self._warnings += 1
 
     def snapshot_and_reset(self) -> dict:
-        with self._lock2:
+        with self._lock:
             snap = {"warnings": self._warnings, "errors": self._errors}
             self._warnings = 0
             self._errors = 0
@@ -110,6 +94,24 @@ class LogCounterHandler(logging.Handler):
 
 def setup_logging(service: str, level: str = "INFO", fmt: str = "json", stream: IO[str] | None = None) -> LogCounterHandler:
     """Root-Logger auf genau einen Stream-Handler (JSON oder Text) plus Zähler setzen."""
+    global _previous_factory, _factory_is_installed
+
+    # Install job-capture factory idempotently.
+    if not _factory_is_installed:
+        _previous_factory = logging.getLogRecordFactory()
+
+        def _job_capture_factory(name, level, fn, lno, msg, args, exc_info=None, func=None, sinfo=None, **kwargs):
+            """LogRecord factory that captures the current job context."""
+            record = _previous_factory(name, level, fn, lno, msg, args, exc_info, func, sinfo, **kwargs)
+            if not hasattr(record, 'job'):
+                job = current_job()
+                if job:
+                    record.job = job
+            return record
+
+        logging.setLogRecordFactory(_job_capture_factory)
+        _factory_is_installed = True
+
     root = logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
@@ -125,3 +127,25 @@ def setup_logging(service: str, level: str = "INFO", fmt: str = "json", stream: 
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
     return counter
+
+
+def _reset_for_tests() -> None:
+    """Reset logging state for test isolation."""
+    global _previous_factory, _factory_is_installed
+
+    root = logging.getLogger()
+    # Remove all root handlers.
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    # Reset root level to WARNING.
+    root.setLevel(logging.WARNING)
+
+    # Restore the previous LogRecord factory if it was saved.
+    if _factory_is_installed and _previous_factory:
+        logging.setLogRecordFactory(_previous_factory)
+    _factory_is_installed = False
+    _previous_factory = None
+
+    # Reset QUIET_LOGGERS levels to NOTSET.
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.NOTSET)
