@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fc-telemetry"
-version = "0.1.0"
+version = "0.1.1"
 description = "Einheitliches JSON-Logging, MongoDB-Aktivitätszähler und Heartbeats für die Finanz-Copilot-Dienste"
 readme = "README.md"
 requires-python = ">=3.10"

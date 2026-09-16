@@ -55,18 +55,10 @@ class MongoHeartbeatWriter:
     def ensure_setup(self) -> None:
         db = self._db()
         db[LIVE_COLLECTION].create_index([("service", ASCENDING), ("pid", ASCENDING)], unique=True)
-        if type(db).__module__.split(".")[0] != "mongomock":
-            # mongomock wertet expireAfterSeconds sofort aus (kein asynchroner
-            # Hintergrund-Sweep wie bei echtem MongoDB) und würde Test-Dokumente mit
-            # fixer, nicht mit der Wanduhr synchronisierter ts sofort wieder löschen.
-            # Echtes MongoDB bekommt den TTL-Index unverändert.
-            db[LIVE_COLLECTION].create_index([("ts", ASCENDING)], expireAfterSeconds=LIVE_TTL_SECONDS)
+        db[LIVE_COLLECTION].create_index([("ts", ASCENDING)], expireAfterSeconds=LIVE_TTL_SECONDS)
         try:
             db.create_collection(HISTORY_COLLECTION, capped=True, size=HISTORY_CAPPED_BYTES)
         except CollectionInvalid:
-            pass
-        except NotImplementedError:
-            # mongomock (Tests) bildet capped/size nicht ab; echtes pymongo wirft das nie.
             pass
         db[HISTORY_COLLECTION].create_index([("service", ASCENDING), ("ts", ASCENDING)])
 
@@ -146,17 +138,18 @@ class Heartbeat:
             logger.warning("%s: %s: %s", msg, type(exc).__name__, exc)
 
     def tick(self) -> dict:
-        doc = self.build_document()
         try:
+            doc = self.build_document()
             if not self._setup_done:
                 self._writer.ensure_setup()
                 self._setup_done = True
             history = self._ticks % self._history_every == 0
             self._writer.write(doc, history)
             self._ticks += 1
+            return doc
         except Exception as exc:  # Dienst darf nie am Heartbeat scheitern
             self._warn("Heartbeat konnte nicht geschrieben werden", exc)
-        return doc
+            return {}
 
     def _run(self) -> None:
         while not self._stop.is_set():

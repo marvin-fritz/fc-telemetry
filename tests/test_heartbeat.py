@@ -88,6 +88,21 @@ def test_writer_failure_is_swallowed_and_rate_limited(caplog):
     assert sum("Heartbeat konnte nicht geschrieben werden" in r.message for r in caplog.records) == 1
 
 
+def test_build_failure_does_not_kill_tick(caplog, monkeypatch):
+    hb = Heartbeat("webapi", writer=ListWriter(), now=_fixed_now, clock=lambda: 0.0)
+
+    def boom():
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(hb, "build_document", boom)
+    with caplog.at_level(logging.WARNING):
+        result1 = hb.tick()
+        result2 = hb.tick()
+    assert result1 == {}
+    assert result2 == {}
+    assert sum(r.levelno == logging.WARNING for r in caplog.records) == 1
+
+
 def test_start_stop_thread_runs_ticks():
     w = ListWriter()
     hb = Heartbeat("kraken", writer=w, interval=0.05, now=_fixed_now)
@@ -101,7 +116,6 @@ def test_start_stop_thread_runs_ticks():
 def test_mongo_writer_upserts_by_service_and_pid_and_creates_history():
     client = mongomock.MongoClient()
     w = MongoHeartbeatWriter("mongodb://ignored", database="financecentre", client=client)
-    w.ensure_setup()
     doc = {"service": "kraken", "pid": 7, "ts": _fixed_now(), "mongo": {"reads": 1}}
     w.write(doc, history=True)
     w.write({**doc, "mongo": {"reads": 2}}, history=False)

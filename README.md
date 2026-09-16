@@ -13,4 +13,4 @@ hb = Heartbeat("kraken", mongo_uri, activity=activity)
 hb.start()                                           # Daemon-Thread, alle 5 s
 ```
 
-Installation per Tag: `fc-telemetry @ git+https://github.com/marvin-fritz/fc-telemetry.git@v0.1.0`
+Installation per Tag: `fc-telemetry @ git+https://github.com/marvin-fritz/fc-telemetry.git@v0.1.1`
