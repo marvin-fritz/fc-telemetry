@@ -8,11 +8,18 @@ import time
 from typing import Callable
 
 
+def _page_size() -> int:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        return 4096
+
+
 class ProcStats:
     def __init__(self, statm_path: str = "/proc/self/statm", clock: Callable[[], float] = time.monotonic) -> None:
         self._statm_path = statm_path
         self._clock = clock
-        self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        self._page_size = _page_size()
         self._last_cpu: float | None = None
         self._last_wall: float | None = None
 

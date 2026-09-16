@@ -35,3 +35,12 @@ def test_cpu_pct_is_delta_based(monkeypatch, tmp_path):
 def test_missing_statm_omits_rss(tmp_path):
     stats = ProcStats(statm_path=str(tmp_path / "nope"), clock=lambda: 1.0)
     assert "rssMb" not in stats.snapshot()
+
+
+def test_page_size_falls_back_when_sysconf_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setattr("fc_telemetry.proc.os.sysconf", lambda x: (_ for _ in ()).throw(ValueError("unrecognized configuration name")))
+    statm = tmp_path / "statm"
+    statm.write_text("1 1000 0 0 0 0 0\n")
+    stats = ProcStats(statm_path=str(statm), clock=lambda: 1.0)
+    snap = stats.snapshot()
+    assert snap["rssMb"] == round(1000 * 4096 / (1024 * 1024), 1)
