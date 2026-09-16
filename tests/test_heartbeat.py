@@ -1,14 +1,22 @@
 import logging
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import mongomock
 import pytest
 
 from fc_telemetry.context import job_context, record_job_error, _reset_for_tests
-from fc_telemetry.heartbeat import Heartbeat, MongoHeartbeatWriter
+from fc_telemetry.heartbeat import Heartbeat, MongoHeartbeatWriter, _merge_counters
 from fc_telemetry.logging_setup import LogCounterHandler
 from fc_telemetry.mongo_activity import MongoActivity
+
+
+def _mongo_read(activity, request_id, micros=1000):
+    activity.started(
+        SimpleNamespace(command_name="find", command={"find": "news"}, request_id=request_id, database_name="financecentre")
+    )
+    activity.succeeded(SimpleNamespace(command_name="find", request_id=request_id, duration_micros=micros))
 
 
 @pytest.fixture(autouse=True)
@@ -86,6 +94,84 @@ def test_writer_failure_is_swallowed_and_rate_limited(caplog):
     with caplog.at_level(logging.WARNING):
         hb.tick(); hb.tick()
     assert sum("Heartbeat konnte nicht geschrieben werden" in r.message for r in caplog.records) == 1
+
+
+def test_failed_write_carries_counters_into_next_tick(caplog):
+    class FlakyWriter(ListWriter):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def write(self, doc, history):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError("mongo weg")
+            super().write(doc, history)
+
+    activity = MongoActivity()
+    counter = LogCounterHandler()
+    w = FlakyWriter()
+    hb = Heartbeat(
+        "webapi", writer=w, activity=activity, log_counter=counter,
+        providers={"http": lambda: {"requests": 3}}, now=_fixed_now, clock=lambda: 0.0,
+    )
+
+    for i in range(2):
+        _mongo_read(activity, i)
+    counter.emit(logging.LogRecord("x", logging.WARNING, "f", 1, "w", (), None))
+    with caplog.at_level(logging.WARNING):
+        result1 = hb.tick()
+    assert result1 == {}
+    assert w.docs == []  # write failed, nothing persisted
+
+    for i in range(2, 5):
+        _mongo_read(activity, i)
+    counter.emit(logging.LogRecord("x", logging.WARNING, "f", 1, "w", (), None))
+    result2 = hb.tick()
+
+    assert len(w.docs) == 1
+    written_doc, _ = w.docs[0]
+    assert written_doc["mongo"]["reads"] == 5
+    assert written_doc["logs"]["warnings"] == 2
+    assert written_doc["http"]["requests"] == 6
+    assert result2 is written_doc
+
+
+def test_merge_counters_adds_bycollection():
+    pending = {
+        "mongo": {
+            "reads": 2, "writes": 1, "errors": 0, "latencyMsAvg": 10.0,
+            "byCollection": {
+                "financecentre.news": {"reads": 2, "writes": 0},
+                "financecentre.insiderTrades": {"reads": 0, "writes": 1},
+            },
+        },
+        "logs": {"warnings": 1, "errors": 0},
+        "http": {"requests": 3, "latencyMsAvg": 5.0},
+    }
+    doc = {
+        "mongo": {
+            "reads": 1, "writes": 0, "errors": 1, "latencyMsAvg": 20.0,
+            "byCollection": {"financecentre.news": {"reads": 1, "writes": 0}},
+        },
+        "logs": {"warnings": 0, "errors": 1},
+        "http": {"requests": 4, "latencyMsAvg": 8.0},
+    }
+
+    _merge_counters(pending, doc)
+
+    assert doc["mongo"]["reads"] == 3
+    assert doc["mongo"]["writes"] == 1
+    assert doc["mongo"]["errors"] == 1
+    assert doc["mongo"]["byCollection"] == {
+        "financecentre.news": {"reads": 3, "writes": 0},
+        "financecentre.insiderTrades": {"reads": 0, "writes": 1},
+    }
+    # latencyMsAvg ist request-count-gewichtet: (10*3 + 20*1) / 4 = 12.5
+    assert doc["mongo"]["latencyMsAvg"] == 12.5
+    assert doc["logs"] == {"warnings": 1, "errors": 1}
+    assert doc["http"]["requests"] == 7
+    assert doc["http"]["latencyMsAvg"] == 8.0  # latencyMsAvg-Felder werden nie summiert
 
 
 def test_build_failure_does_not_kill_tick(caplog, monkeypatch):

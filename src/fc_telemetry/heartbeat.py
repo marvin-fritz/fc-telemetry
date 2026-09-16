@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Callable, Protocol
 
 from pymongo import ASCENDING, MongoClient
-from pymongo.errors import CollectionInvalid
+from pymongo.errors import CollectionInvalid, OperationFailure
 
 from .context import active_jobs, job_error_state
 from .logging_setup import LogCounterHandler
@@ -32,6 +32,67 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_RESERVED_DOC_KEYS = frozenset(
+    {"service", "ts", "pid", "host", "version", "startedAt", "intervalSec", "proc", "mongo", "jobs", "logs"}
+)
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _merge_counters(pending: dict, doc: dict) -> None:
+    """Traegt Zaehler aus einem Dokument, dessen Schreibvorgang fehlschlug (pending),
+    in das aktuelle Dokument vor, damit sie nicht verloren gehen."""
+    p_mongo = pending.get("mongo")
+    d_mongo = doc.get("mongo")
+    if isinstance(p_mongo, dict) and isinstance(d_mongo, dict):
+        p_reads = p_mongo.get("reads", 0) or 0
+        p_writes = p_mongo.get("writes", 0) or 0
+        d_reads = d_mongo.get("reads", 0) or 0
+        d_writes = d_mongo.get("writes", 0) or 0
+        p_count = p_reads + p_writes
+        d_count = d_reads + d_writes
+        d_mongo["reads"] = d_reads + p_reads
+        d_mongo["writes"] = d_writes + p_writes
+        d_mongo["errors"] = (d_mongo.get("errors", 0) or 0) + (p_mongo.get("errors", 0) or 0)
+
+        p_avg = p_mongo.get("latencyMsAvg")
+        d_avg = d_mongo.get("latencyMsAvg")
+        if _is_number(p_avg) and _is_number(d_avg) and (p_count + d_count) > 0:
+            d_mongo["latencyMsAvg"] = round(((p_avg * p_count) + (d_avg * d_count)) / (p_count + d_count), 2)
+        # sonst: Wert von doc behalten (kann nicht sinnvoll gewichtet werden)
+
+        d_by_coll = d_mongo.setdefault("byCollection", {})
+        for key, p_val in (p_mongo.get("byCollection") or {}).items():
+            if isinstance(p_val, dict):
+                bucket = d_by_coll.setdefault(key, {})
+                for sub_key, sub_val in p_val.items():
+                    if _is_number(sub_val):
+                        bucket[sub_key] = (bucket.get(sub_key, 0) or 0) + sub_val
+            elif _is_number(p_val):
+                d_by_coll[key] = (d_by_coll.get(key, 0) or 0) + p_val
+
+    p_logs = pending.get("logs")
+    d_logs = doc.get("logs")
+    if isinstance(p_logs, dict) and isinstance(d_logs, dict):
+        d_logs["warnings"] = (d_logs.get("warnings", 0) or 0) + (p_logs.get("warnings", 0) or 0)
+        d_logs["errors"] = (d_logs.get("errors", 0) or 0) + (p_logs.get("errors", 0) or 0)
+
+    for key, p_val in pending.items():
+        if key in _RESERVED_DOC_KEYS or not isinstance(p_val, dict):
+            continue
+        d_val = doc.get(key)
+        if not isinstance(d_val, dict):
+            continue
+        for sub_key, sub_val in p_val.items():
+            if sub_key == "latencyMsAvg" or not _is_number(sub_val):
+                continue
+            existing = d_val.get(sub_key)
+            if _is_number(existing):
+                d_val[sub_key] = existing + sub_val
+
+
 class HeartbeatWriter(Protocol):
     def ensure_setup(self) -> None: ...
     def write(self, doc: dict, history: bool) -> None: ...
@@ -48,7 +109,12 @@ class MongoHeartbeatWriter:
     def _db(self):
         if self._client is None:
             self._client = MongoClient(
-                self._uri, maxPoolSize=1, appName="fc-telemetry", serverSelectionTimeoutMS=3000, connectTimeoutMS=3000
+                self._uri,
+                maxPoolSize=1,
+                appName="fc-telemetry",
+                serverSelectionTimeoutMS=3000,
+                connectTimeoutMS=3000,
+                socketTimeoutMS=5000,
             )
         return self._client[self._database]
 
@@ -58,8 +124,10 @@ class MongoHeartbeatWriter:
         db[LIVE_COLLECTION].create_index([("ts", ASCENDING)], expireAfterSeconds=LIVE_TTL_SECONDS)
         try:
             db.create_collection(HISTORY_COLLECTION, capped=True, size=HISTORY_CAPPED_BYTES)
-        except CollectionInvalid:
-            pass
+        except (CollectionInvalid, OperationFailure) as exc:
+            # Code 48 = NamespaceExists: paralleler Prozess war schneller, das ist ok.
+            if isinstance(exc, OperationFailure) and getattr(exc, "code", None) != 48:
+                raise
         db[HISTORY_COLLECTION].create_index([("service", ASCENDING), ("ts", ASCENDING)])
 
     def write(self, doc: dict, history: bool) -> None:
@@ -103,6 +171,7 @@ class Heartbeat:
         self._ticks = 0
         self._setup_done = False
         self._last_warn: float | None = None
+        self._pending: dict | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -127,8 +196,8 @@ class Heartbeat:
         for name, provider in self._providers.items():
             try:
                 doc[name] = provider()
-            except Exception:
-                logger.exception("Heartbeat-Provider '%s' fehlgeschlagen", name)
+            except Exception as exc:
+                self._warn(f"Heartbeat-Provider '{name}' fehlgeschlagen", exc)
         return doc
 
     def _warn(self, msg: str, exc: BaseException) -> None:
@@ -138,8 +207,12 @@ class Heartbeat:
             logger.warning("%s: %s: %s", msg, type(exc).__name__, exc)
 
     def tick(self) -> dict:
+        doc = None
         try:
             doc = self.build_document()
+            if self._pending is not None:
+                _merge_counters(self._pending, doc)
+                self._pending = None
             if not self._setup_done:
                 self._writer.ensure_setup()
                 self._setup_done = True
@@ -148,6 +221,9 @@ class Heartbeat:
             self._ticks += 1
             return doc
         except Exception as exc:  # Dienst darf nie am Heartbeat scheitern
+            if doc is not None:
+                # Zaehler nicht verlieren: beim naechsten erfolgreichen tick nachtragen.
+                self._pending = doc
             self._warn("Heartbeat konnte nicht geschrieben werden", exc)
             return {}
 

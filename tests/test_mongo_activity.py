@@ -33,8 +33,8 @@ def test_counts_reads_and_writes_per_collection_with_latency():
     assert snap["reads"] == 2 and snap["writes"] == 2 and snap["errors"] == 0
     assert snap["latencyMsAvg"] == 5.0
     assert snap["byCollection"] == {
-        "insiderTrades": {"reads": 1, "writes": 1},
-        "news": {"reads": 1, "writes": 1},
+        "financecentre.insiderTrades": {"reads": 1, "writes": 1},
+        "financecentre.news": {"reads": 1, "writes": 1},
     }
     assert l.snapshot_and_reset()["reads"] == 0
 
@@ -61,7 +61,7 @@ def test_getmore_uses_collection_from_command():
     event = SimpleNamespace(command_name="getMore", command={"getMore": 42, "collection": "stockPrices"}, request_id=9, database_name="financecentre")
     listener.started(event)
     _succeeded(l, "getMore", 9, 100)
-    assert l.snapshot_and_reset()["byCollection"] == {"stockPrices": {"reads": 1, "writes": 0}}
+    assert l.snapshot_and_reset()["byCollection"] == {"financecentre.stockPrices": {"reads": 1, "writes": 0}}
 
 
 def test_install_is_idempotent_and_registers_globally():

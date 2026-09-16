@@ -49,10 +49,11 @@ class MongoActivity(monitoring.CommandListener):
         coll = _collection_of(event)
         if coll is None or coll in IGNORED_COLLECTIONS:
             return
+        qualified_coll = f"{event.database_name}.{coll}"
         with self._lock:
             if len(self._inflight) > INFLIGHT_MAX_ENTRIES:
                 self._inflight.clear()
-            self._inflight[event.request_id] = (kind, coll, self._clock())
+            self._inflight[event.request_id] = (kind, qualified_coll, self._clock())
 
     def _finish(self, event, failed: bool) -> None:
         with self._lock:
